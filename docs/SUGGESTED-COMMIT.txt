@@ -1,0 +1,54 @@
+feat(m0): Groq provider adapter, agent contracts and Planning Lab harness
+
+Implements milestone M0 of the DevOffice AI Master Blueprint v1.0: a
+provider-agnostic model adapter plus the agent output contracts, proven by a
+CLI harness over the three benchmark briefs in LLD 14.1. No web UI, no spec
+generation, no coding engine - those are M1, M3 and M4/M5.
+
+What is here
+
+- providers/: ModelProvider interface per LLD 4.1, with a Groq implementation
+  over the OpenAI-compatible endpoint using injectable fetch. Token-aware AND
+  request-aware throttle; 429 handling that tells a per-minute burst apart from
+  a daily quota wall; bounded exponential backoff with full jitter; no paid
+  fallback, ever.
+- shared/schemas.ts: ProjectBriefV1, RequirementSetV1, AgentContributionV1,
+  ArchitectureDecisionV1, TechLeadSynthesisV1. The LLD 6.2 cross-review rule is
+  enforced in code: an objection must cite a proposal that exists, carry
+  evidence, and recommend a concrete change. "I agree" is rejected.
+- shared/json-schema.ts: startup guard that fails loudly, with a JSON pointer,
+  when a schema is not compatible with Groq strict mode. .optional() is banned.
+- shared/events.ts: append-only JSONL event and usage log with a monotonic
+  per-run sequence and idempotency keys, so a killed worker resumes from its
+  last checkpoint without duplicating events or re-buying completed work.
+- workflows/meeting.ts: deterministic three-round orchestration. Roster
+  selection is code, not a model call.
+- workflows/build-gate.ts: requestBuild() always refuses with
+  BUILD_NOT_ENABLED. There is no child_process, eval or vm anywhere in src/,
+  asserted by a static scan in the test suite.
+
+Contract changes that need Product Owner sign-off
+
+- AgentContributionV1 gains recommended_change and evidence. LLD 6.2 requires an
+  objection to recommend a fix, but the example payload had no field to carry
+  one, so the rule could not be enforced. See docs/M0-REPORT.md A5.
+
+Blueprint findings
+
+13 contradictions, risks and unverified assumptions are recorded in
+docs/M0-REPORT.md section A. The most consequential: the Llama models the plan
+assumed for Groq's free tier are now Enterprise-only, and the binding limit is
+tokens per minute (8K) rather than requests per minute (30), which makes one
+meeting take minutes rather than seconds.
+
+Verification
+
+  tsc --noEmit    0 errors
+  vitest run      101 passed / 101, 6 files
+
+No real API call has been made: there is no GROQ_API_KEY in this environment.
+Groq wire-format compatibility and agent critique quality are both UNVERIFIED
+and need a key. The LLD 14.2 rubric is emitted blank on purpose - a
+self-scored acceptance gate is theatre.
+
+Refs: HLD 10, 12; LLD 4, 5, 6, 7, 14, 16, 18, 20

@@ -1,0 +1,27 @@
+{
+  "name": "devoffice-ai",
+  "version": "0.1.0-m0",
+  "private": true,
+  "type": "module",
+  "description": "DevOffice AI - M0 technical spike: provider-agnostic model adapter + agent contracts (Planning Lab)",
+  "engines": { "node": ">=20.11.0" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:env": "tsx src/cli/check-env.ts",
+    "models": "tsx src/cli/list-models.ts",
+    "bench": "tsx src/cli/run-benchmark.ts",
+    "bench:mock": "tsx src/cli/run-benchmark.ts --provider=mock --brief=all"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.10",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.1.1"
+  }
+}
