@@ -393,6 +393,24 @@ export const TechLeadDecisionsV1Base = z.object({
 });
 
 export const TechLeadDecisionsV1 = TechLeadDecisionsV1Base.superRefine((value, ctx) => {
+  // Decision ids are referenced by the change log and by every requirement
+  // disposition. Two decisions sharing an id makes those references point at
+  // nothing in particular - a real failure the old `min(3)` never caught.
+  const seen = new Set<string>();
+  value.decisions.forEach((d, index) => {
+    const key = d.decision_id.trim().toLowerCase();
+    if (seen.has(key)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['decisions', index, 'decision_id'],
+        message:
+          `"${d.decision_id}" is used by more than one decision. Ids must be unique, because ` +
+          'the change log and the requirement dispositions refer back to them',
+      });
+    }
+    seen.add(key);
+  });
+
   if (value.verdict !== 'proceed' && value.verdict_conditions.length === 0) {
     ctx.addIssue({
       code: 'custom',

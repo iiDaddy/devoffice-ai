@@ -237,9 +237,12 @@ describe('T17: instructions inside untrusted project data', () => {
 
 describe('secrets handling (LLD 16)', () => {
   it('redactConfig never emits the key', () => {
-    const config = testConfig({ GROQ_API_KEY: 'gsk_supersecret_value_123' });
+    // Deliberately NOT shaped like a real Groq key: this repo is public, and a
+    // realistic-looking fake trips secret scanners on every push. The patterns
+    // below that DO match the real shape are detectors, not samples.
+    const config = testConfig({ GROQ_API_KEY: 'test-key-redaction-sample-0000' });
     const redacted = JSON.stringify(redactConfig(config));
-    expect(redacted).not.toContain('gsk_supersecret_value_123');
+    expect(redacted).not.toContain('test-key-redaction-sample-0000');
     expect(redacted).toContain('redacted');
   });
 

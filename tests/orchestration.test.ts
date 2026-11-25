@@ -348,6 +348,133 @@ describe('quota exhaustion and resume (T13, T14)', () => {
   });
 });
 
+/**
+ * Resuming across the round-3 split.
+ *
+ * Round 3 used to be one call keyed `r3:synthesis:tech_lead`. It is now two,
+ * keyed `r3a:decisions:tech_lead` and `r3b:dispositions:tech_lead`. Rounds 1
+ * and 2 kept their keys, so an existing save point must still replay them and
+ * only redo round 3 - which is exactly what happens when a run that died at
+ * synthesis is resumed after the fix.
+ */
+describe('resume after the round-3 split', () => {
+  const truncated = new DevOfficeError('OUTPUT_TRUNCATED', 'cut off at the token limit', {
+    retryable: false,
+  });
+
+  it('replays rounds 1 and 2, and only re-runs round 3', async () => {
+    const dir = freshDir();
+
+    // Call 10 is the first round-3 call: PM + 4 proposals + 4 reactions = 9.
+    const firstLog = new EventLog({ runsDir: dir, runId: 'run-split', projectId: 'p1' });
+    const dying = new FailAfterProvider(10, truncated);
+    const firstRun = await runMeeting({
+      provider: dying,
+      eventLog: firstLog,
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-split',
+    });
+
+    expect(firstRun.state).toBe('BLOCKED');
+    expect(firstRun.errorCode).toBe('OUTPUT_TRUNCATED');
+    expect(firstRun.proposals).toHaveLength(4);
+    expect(firstRun.reactions).toHaveLength(4);
+    expect(firstRun.synthesis).toBeNull();
+
+    // A new worker picks the same run up.
+    const resumedLog = new EventLog({ runsDir: dir, runId: 'run-split', projectId: 'p1' });
+    const healthy = new FailAfterProvider(Number.POSITIVE_INFINITY, truncated);
+    const resumed = await runMeeting({
+      provider: healthy,
+      eventLog: resumedLog,
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-split',
+    });
+
+    // The nine completed contributions came back from disk, not from Groq.
+    expect(resumed.replayedFromLog).toBe(9);
+    // Only the two round-3 calls were bought.
+    expect(healthy.callCount).toBe(2);
+    expect(resumed.synthesis).not.toBeNull();
+    expect(resumed.synthesis?.requirement_dispositions.length).toBeGreaterThan(0);
+
+    // No duplicates anywhere.
+    const keys = resumedLog
+      .readAll()
+      .map((e) => e.idempotency_key)
+      .filter((k): k is string => k !== null);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+
+  it('ignores a round-3 entry left behind under the old single-call key', async () => {
+    const dir = freshDir();
+    const log = new EventLog({ runsDir: dir, runId: 'run-stale', projectId: 'p1' });
+
+    // What an interrupted pre-split run left on disk.
+    log.append({
+      event_type: 'agent_contribution',
+      role: 'tech_lead',
+      round: 3,
+      meeting_id: 'm1',
+      idempotency_key: 'run-stale:r3:synthesis:tech_lead',
+      payload_json: { data: { consensus_summary: 'from the old contract shape' } },
+      display_text: 'stale round-3 entry',
+    });
+
+    const result = await runMeeting({
+      provider: new MockProvider(),
+      eventLog: log,
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-stale',
+    });
+
+    // The stale entry is not replayed into either new step, so round 3 is
+    // answered afresh rather than half-restored from an incompatible payload.
+    expect(result.replayedFromLog).toBe(0);
+    expect(result.synthesis).not.toBeNull();
+    expect(result.synthesis?.consensus_summary).not.toContain('old contract shape');
+    expect(result.verdict).not.toBeNull();
+  });
+
+  it('a second resume of a finished meeting buys nothing at all', async () => {
+    const dir = freshDir();
+    const options = { runsDir: dir, runId: 'run-done', projectId: 'p1' };
+
+    await runMeeting({
+      provider: new MockProvider(),
+      eventLog: new EventLog(options),
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-done',
+    });
+
+    const again = await runMeeting({
+      provider: new MockProvider(),
+      eventLog: new EventLog(options),
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-done',
+    });
+
+    expect(again.modelAttempts).toBe(0);
+    expect(again.replayedFromLog).toBe(11);
+    expect(again.state).toBe('NEEDS_INPUT');
+  });
+});
+
 describe('evidence signals', () => {
   it('counts what it can check and leaves judgement to a human', async () => {
     const dir = freshDir();

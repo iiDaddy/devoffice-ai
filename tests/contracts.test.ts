@@ -243,11 +243,11 @@ describe('configuration', () => {
     // yet". If that were a validation error, `npm run models` - the command
     // that tells you what to choose - could never run.
     const config = loadConfig({
-      GROQ_API_KEY: 'gsk_fake_for_test',
+      GROQ_API_KEY: 'test-key-not-a-real-credential',
       GROQ_MODEL_PLANNING: '',
     } as NodeJS.ProcessEnv);
     expect(config.GROQ_MODEL_PLANNING).toBeNull();
-    expect(config.GROQ_API_KEY).toBe('gsk_fake_for_test');
+    expect(config.GROQ_API_KEY).toBe('test-key-not-a-real-credential');
   });
 
   it('falls back to defaults when a numeric setting is left blank', () => {
