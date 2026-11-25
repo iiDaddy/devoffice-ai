@@ -276,16 +276,30 @@ describe('project verdict', () => {
     ).toBe(true);
   });
 
-  it('the prompt tells the Tech Lead that refusing is a legitimate output', () => {
+  it('the decisions prompt tells the Tech Lead that refusing is a legitimate output', () => {
     const instruction = buildSystemInstruction({
       role: 'tech_lead',
       round: 3,
       projectId: 'p1',
       meetingId: 'm1',
+      outputContract: 'TechLeadDecisionsV1',
     });
     expect(instruction).toContain('do_not_proceed');
     expect(instruction).toContain('not a failure to plan');
+  });
+
+  it('the dispositions prompt insists every requirement is accounted for', () => {
+    const instruction = buildSystemInstruction({
+      role: 'tech_lead',
+      round: 3,
+      projectId: 'p1',
+      meetingId: 'm1',
+      outputContract: 'RequirementDispositionSetV1',
+    });
+    expect(instruction).toContain('ONE ENTRY FOR EVERY REQUIREMENT ID');
     expect(instruction).toContain('Leaving a requirement out is a validation failure');
+    // And it is not handed the other call's instructions by mistake.
+    expect(instruction).not.toContain('verdict_conditions');
   });
 });
 
@@ -302,7 +316,7 @@ class RefusingProvider implements ModelProvider {
 
   async generateStructured<T>(request: ModelRequest<T>): Promise<ModelResponse<T>> {
     const response = await this.inner.generateStructured(request);
-    if (request.contract.schemaName !== 'TechLeadSynthesisV1') return response as ModelResponse<T>;
+    if (request.contract.schemaName !== 'TechLeadDecisionsV1') return response as ModelResponse<T>;
 
     const data = response.data as Record<string, unknown>;
     const refused = {

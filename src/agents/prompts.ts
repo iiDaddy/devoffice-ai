@@ -66,6 +66,23 @@ function contractRules(outputContract: string): string {
         '  questions. Use [] for a genuinely empty list - never a placeholder like "N/A".',
       ].join('\n');
 
+    case 'RequirementDispositionSetV1':
+      return [
+        'OUTPUT CONTRACT - RequirementDispositionSetV1. One field, and it must be complete.',
+        '',
+        '  requirement_dispositions: ONE ENTRY FOR EVERY REQUIREMENT ID YOU WERE GIVEN.',
+        '    { requirement_id, status, decision_id, note }',
+        '    - requirement_id: exactly as listed. Do not invent ids.',
+        '    - status: decided | deferred | blocked | out_of_scope',
+        '    - decision_id: required when status is "decided", and it must be one of the',
+        '      decisions you were shown. null for every other status.',
+        '    - note: at least 15 characters saying why it has that status.',
+        '',
+        '  Leaving a requirement out is a validation failure. If one is risky and you have',
+        '  not settled it, mark it "blocked" and say so - do not go quiet on it.',
+      ].join('\n');
+
+    case 'TechLeadDecisionsV1':
     case 'TechLeadSynthesisV1':
       return [
         'OUTPUT CONTRACT - TechLeadSynthesisV1. Every field is required.',
@@ -93,14 +110,8 @@ function contractRules(outputContract: string): string {
         '    - selected: must exactly match one of the alternative names you listed.',
         '    - rationale: at least 40 characters, naming the trade-off you accepted.',
         '',
-        '  requirement_dispositions: ONE ENTRY FOR EVERY REQUIREMENT ID YOU WERE GIVEN.',
-        '    { requirement_id, status, decision_id, note }',
-        '    - status: decided | deferred | blocked | out_of_scope',
-        '    - decision_id: required when status is "decided"; must match a decision above.',
-        '      null otherwise.',
-        '    - note: at least 15 characters saying why it has that status.',
-        '    Leaving a requirement out is a validation failure. If a requirement is risky and',
-        '    you have not settled it, say so with "blocked" - do not go quiet on it.',
+        '  You are NOT listing requirement dispositions here - that is a separate step',
+        '  straight after this one. Concentrate on the verdict and the decisions.',
         '',
         '  changed_due_to_feedback: array of',
         '    { decision_id, triggered_by_role, related_proposal_id, previous_position,',
@@ -146,6 +157,15 @@ export interface PromptContext {
   readonly round: 1 | 2 | 3;
   readonly projectId: string;
   readonly meetingId: string;
+  /**
+   * The contract this particular call must satisfy.
+   *
+   * Defaults to the role's usual one. Needed because round 3 is now two calls
+   * with two different schemas from the same role: without this the second
+   * call was handed the first call's instructions and told to produce fields
+   * it was not being asked for.
+   */
+  readonly outputContract?: string;
 }
 
 export function buildSystemInstruction(context: PromptContext): string {
@@ -173,6 +193,8 @@ export function buildSystemInstruction(context: PromptContext): string {
             'question so a human answers it.',
           ].join('\n');
 
+  const outputContract = context.outputContract ?? definition.output_contract;
+
   return [
     `You are the ${definition.display_name} on an AI software team. Your role id is "${definition.role}".`,
     '',
@@ -187,7 +209,7 @@ export function buildSystemInstruction(context: PromptContext): string {
     '',
     ANTI_THEATRE_RULES,
     '',
-    contractRules(definition.output_contract),
+    contractRules(outputContract),
   ].join('\n');
 }
 

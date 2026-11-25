@@ -23,6 +23,9 @@ import { z } from 'zod';
 import {
   AgentContributionV1,
   AgentContributionV1Base,
+  RequirementDispositionSetV1Base,
+  TechLeadDecisionsV1,
+  TechLeadDecisionsV1Base,
   TechLeadSynthesisV1,
   TechLeadSynthesisV1Base,
 } from '../shared/schemas.js';
@@ -31,6 +34,11 @@ import type { StructuredContract } from '../providers/types.js';
 
 const CONTRIBUTION_WIRE = buildGroqJsonSchema('AgentContributionV1', AgentContributionV1Base);
 const SYNTHESIS_WIRE = buildGroqJsonSchema('TechLeadSynthesisV1', TechLeadSynthesisV1Base);
+const DECISIONS_WIRE = buildGroqJsonSchema('TechLeadDecisionsV1', TechLeadDecisionsV1Base);
+const DISPOSITIONS_WIRE = buildGroqJsonSchema(
+  'RequirementDispositionSetV1',
+  RequirementDispositionSetV1Base,
+);
 
 function contractFor(
   validator: z.ZodType<z.infer<typeof AgentContributionV1>>,
@@ -160,5 +168,87 @@ export function synthesisContract(
     validator,
     jsonSchema: SYNTHESIS_WIRE.jsonSchema,
     strippedKeywords: SYNTHESIS_WIRE.strippedKeywords,
+  };
+}
+
+
+/* ------------------------------------------------------------------ *
+ * Round 3, split in two (see the comment in shared/schemas.ts)
+ * ------------------------------------------------------------------ */
+
+/** 3a: the verdict, the decisions, and what round 2 changed. */
+export const DECISIONS_CONTRACT: StructuredContract<z.infer<typeof TechLeadDecisionsV1>> = {
+  schemaName: 'TechLeadDecisionsV1',
+  validator: TechLeadDecisionsV1,
+  jsonSchema: DECISIONS_WIRE.jsonSchema,
+  strippedKeywords: DECISIONS_WIRE.strippedKeywords,
+};
+
+/**
+ * 3b: every requirement mapped to one of the decisions just made.
+ *
+ * Built from this meeting's real requirement ids AND the decision ids from
+ * step 3a, so a skipped requirement or a dangling decision reference fails
+ * validation and the repair loop names exactly what is missing.
+ */
+export function dispositionsContract(
+  requirementIds: readonly string[],
+  decisionIds: readonly string[],
+): StructuredContract<z.infer<typeof RequirementDispositionSetV1Base>> {
+  const required = [...new Set(requirementIds)];
+  const known = new Set(decisionIds);
+
+  const validator = RequirementDispositionSetV1Base.superRefine((value, ctx) => {
+    const covered = new Set(value.requirement_dispositions.map((d) => d.requirement_id));
+    const missing = required.filter((id) => !covered.has(id));
+
+    if (missing.length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['requirement_dispositions'],
+        message:
+          'every requirement needs an entry, even if only to say it is deferred or blocked. ' +
+          `Missing: ${missing.join(', ')}`,
+      });
+    }
+
+    const unknown = value.requirement_dispositions
+      .map((d) => d.requirement_id)
+      .filter((id) => !required.includes(id));
+    if (unknown.length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['requirement_dispositions'],
+        message:
+          `these requirement ids do not exist in this meeting: ${unknown.join(', ')}. ` +
+          `The ids are: ${required.join(', ')}`,
+      });
+    }
+
+    value.requirement_dispositions.forEach((disposition, index) => {
+      if (disposition.status !== 'decided') return;
+      if (disposition.decision_id === null) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['requirement_dispositions', index, 'decision_id'],
+          message: 'status "decided" must name the decision record that settles it',
+        });
+      } else if (!known.has(disposition.decision_id)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['requirement_dispositions', index, 'decision_id'],
+          message:
+            `"${disposition.decision_id}" is not a decision from this meeting ` +
+            `(${[...known].join(', ') || 'none were recorded'})`,
+        });
+      }
+    });
+  });
+
+  return {
+    schemaName: 'RequirementDispositionSetV1',
+    validator,
+    jsonSchema: DISPOSITIONS_WIRE.jsonSchema,
+    strippedKeywords: DISPOSITIONS_WIRE.strippedKeywords,
   };
 }

@@ -306,7 +306,9 @@ describe('quota exhaustion and resume (T13, T14)', () => {
     expect(resumed.state).toBe('NEEDS_INPUT');
     // The three contributions already on disk were replayed, not re-requested.
     expect(resumed.replayedFromLog).toBe(3);
-    expect(healthy.callCount).toBe(9 - 3 + 1);
+    // 11 steps in a full meeting now that round 3 is two calls:
+    // PM + 4 proposals + 4 reactions + decisions + dispositions.
+    expect(healthy.callCount).toBe(11 - 3);
 
     // No duplicate events: the sequence is still strictly increasing with no
     // repeated idempotency key.

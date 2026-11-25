@@ -110,6 +110,8 @@ interface TemplateInput {
   readonly brief_summary?: { title?: string; objective?: string };
   readonly target_proposals?: Array<{ proposal_id?: string; agent_role?: string; summary?: string }>;
   readonly requirement_ids?: string[];
+  readonly requirements?: Array<{ id?: string }>;
+  readonly decisions_available?: Array<{ decision_id?: string }>;
 }
 
 function buildTemplate<T>(request: ModelRequest<T>): unknown {
@@ -162,6 +164,22 @@ function buildTemplate<T>(request: ModelRequest<T>): unknown {
       };
     }
 
+    case 'RequirementDispositionSetV1': {
+      const ids = (input.requirements ?? []).map((r) => r.id ?? 'REQ-001');
+      const list = ids.length > 0 ? ids : ['REQ-001'];
+      const decisionIds = (input.decisions_available ?? []).map((d) => d.decision_id ?? 'adr-001');
+      const firstDecision = decisionIds[0] ?? null;
+      return {
+        requirement_dispositions: list.map((id, index) => ({
+          requirement_id: id,
+          status: index === 0 && firstDecision !== null ? 'decided' : 'deferred',
+          decision_id: index === 0 ? firstDecision : null,
+          note: '[SIMULATED] placeholder disposition note for this requirement.',
+        })),
+      };
+    }
+
+    case 'TechLeadDecisionsV1':
     case 'TechLeadSynthesisV1': {
       const requirementIds = input.requirement_ids ?? ['REQ-001'];
       return {

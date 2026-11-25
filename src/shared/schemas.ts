@@ -355,6 +355,88 @@ export const DecisionChangeV1 = z.object({
 });
 export type DecisionChangeV1 = z.infer<typeof DecisionChangeV1>;
 
+/* ------------------------------------------------------------------ *
+ * Round 3 is TWO calls, not one
+ * ------------------------------------------------------------------ *
+ *
+ * It used to be one. On benchmark B3 the provider refused it outright:
+ *
+ *     Request too large ... on tokens per minute (TPM):
+ *     Limit 8000, Requested 8280
+ *
+ * On this tier a single request's prompt PLUS its reserved output must fit
+ * under the per-minute ceiling. Round 3 had grown to ~4,200 tokens of prompt
+ * and needed ~4,100 of output, so it no longer fit in one request - and the
+ * squeeze came from both sides at once: ten requirements made the prompt
+ * bigger AND required ten dispositions in the answer.
+ *
+ * Lowering the output budget only trades the 413 for the truncation we had
+ * just fixed. The answer had outgrown one request, so it is now two:
+ *
+ *   3a  TechLeadDecisionsV1       verdict, decisions, what changed, blockers
+ *   3b  RequirementDispositionSetV1  every requirement mapped to a decision
+ *
+ * This also scales: a twenty-requirement brief would have broken the single
+ * call again. And it is a better order to think in - decide first, then
+ * account for every requirement against those decisions.
+ */
+
+export const TechLeadDecisionsV1Base = z.object({
+  consensus_summary: z.string().min(40),
+  verdict: ProjectVerdict,
+  verdict_justification: z.string().min(40),
+  /** Required when the verdict is not a plain "proceed". */
+  verdict_conditions: z.array(z.string().min(10)),
+  decisions: z.array(ArchitectureDecisionV1Base),
+  changed_due_to_feedback: z.array(DecisionChangeV1),
+  unresolved_blockers: z.array(BlockerV1),
+});
+
+export const TechLeadDecisionsV1 = TechLeadDecisionsV1Base.superRefine((value, ctx) => {
+  if (value.verdict !== 'proceed' && value.verdict_conditions.length === 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['verdict_conditions'],
+      message:
+        `verdict "${value.verdict}" must list what has to be true before this project is safe ` +
+        'to proceed. An empty list means the verdict cannot be acted on',
+    });
+  }
+
+  const decisionIds = new Set(value.decisions.map((d) => d.decision_id));
+
+  value.changed_due_to_feedback.forEach((change, index) => {
+    if (!decisionIds.has(change.decision_id)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['changed_due_to_feedback', index, 'decision_id'],
+        message:
+          `"${change.decision_id}" is not one of the decisions you recorded ` +
+          `(${[...decisionIds].join(', ') || 'none'})`,
+      });
+    }
+    if (
+      change.previous_position.trim().toLowerCase() === change.revised_position.trim().toLowerCase()
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['changed_due_to_feedback', index, 'revised_position'],
+        message: 'previous_position and revised_position are identical, so nothing changed',
+      });
+    }
+  });
+});
+export type TechLeadDecisionsV1 = z.infer<typeof TechLeadDecisionsV1Base>;
+
+export const RequirementDispositionSetV1Base = z.object({
+  requirement_dispositions: z.array(RequirementDispositionV1),
+});
+export type RequirementDispositionSetV1 = z.infer<typeof RequirementDispositionSetV1Base>;
+
+/**
+ * The two halves joined back together. Downstream code - the report, the
+ * signals, the event log - sees one synthesis, as before.
+ */
 export const TechLeadSynthesisV1Base = z.object({
   consensus_summary: z.string().min(40),
   verdict: ProjectVerdict,
@@ -434,6 +516,8 @@ export const SCHEMA_REGISTRY = {
   AgentContributionV1: AgentContributionV1Base,
   ArchitectureDecisionV1: ArchitectureDecisionV1Base,
   TechLeadSynthesisV1: TechLeadSynthesisV1Base,
+  TechLeadDecisionsV1: TechLeadDecisionsV1Base,
+  RequirementDispositionSetV1: RequirementDispositionSetV1Base,
 } as const;
 
 export type SchemaName = keyof typeof SCHEMA_REGISTRY;

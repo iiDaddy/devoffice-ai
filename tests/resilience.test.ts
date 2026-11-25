@@ -415,6 +415,108 @@ describe('model-side failures that Groq reports as HTTP 400', () => {
   });
 });
 
+/**
+ * The per-request ceiling, learned the hard way on benchmark B3.
+ *
+ * The provider refused round 3 with "Limit 8000, Requested 8280" AFTER two
+ * successful repair attempts had already been paid for. A single request's
+ * prompt plus its reserved output is checked against the PER-MINUTE token
+ * allowance - the local throttle cannot help, because that paces how often we
+ * send, not how large one request is.
+ */
+describe('oversized requests are refused before they are sent', () => {
+  function bigRequest(promptTokens: number): ModelRequest<unknown> {
+    // ~4 characters per token, matching estimateTokens().
+    return { ...buildRequest(), userContent: 'x'.repeat(promptTokens * 4) };
+  }
+
+  it('refuses the B3 shape without spending a call', async () => {
+    const { provider, recorder } = makeProvider([chatOk(validProposal())], {
+      maxTokensPerRequest: 8000,
+    });
+
+    let caught: unknown;
+    try {
+      await provider.generateStructured({ ...bigRequest(4100), maxOutputTokens: 4096 });
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({ code: 'PAYLOAD_TOO_LARGE', retryable: false });
+    expect((caught as Error).message).toContain('MODEL_MAX_OUTPUT_TOKENS');
+    expect((caught as Error).message).toContain('no quota was spent');
+    // Nothing reached the network.
+    expect(recorder.calls).toHaveLength(0);
+  });
+
+  it('lets a request through when it fits', async () => {
+    const { provider, recorder } = makeProvider([chatOk(validProposal())], {
+      maxTokensPerRequest: 8000,
+    });
+    await provider.generateStructured({ ...bigRequest(1000), maxOutputTokens: 2048 });
+    expect(recorder.calls).toHaveLength(1);
+  });
+
+  it('learns the ceiling from the provider header rather than being told', async () => {
+    // No maxTokensPerRequest configured. chatOk() reports a limit of 8000.
+    const { provider, recorder } = makeProvider([
+      chatOk(validProposal()),
+      chatOk(validProposal()),
+    ]);
+
+    // First call goes out blind - nothing is known yet.
+    await provider.generateStructured(buildRequest());
+    expect(provider.lastRateLimitSnapshot()?.limitTokens).toBe(8000);
+
+    // Second call is measured against the limit just observed.
+    await expect(
+      provider.generateStructured({ ...bigRequest(5000), maxOutputTokens: 4096 }),
+    ).rejects.toMatchObject({ code: 'PAYLOAD_TOO_LARGE' });
+    expect(recorder.calls).toHaveLength(1);
+  });
+});
+
+describe('a failed call reports what it already cost', () => {
+  it('REGRESSION B3: repairs spent before a failure are not reported as zero', async () => {
+    const schemaMiss = {
+      status: 400,
+      body: {
+        error: {
+          message: 'Generated JSON does not match the expected schema.',
+          type: 'invalid_request_error',
+          code: 'json_validate_failed',
+        },
+      },
+    };
+    // Two repairs, then the oversized-request wall - exactly the B3 sequence.
+    const { provider } = makeProvider([schemaMiss, schemaMiss, rateLimited('7200')]);
+
+    let caught: unknown;
+    try {
+      await provider.generateStructured(buildRequest());
+    } catch (error) {
+      caught = error;
+    }
+
+    const details = (caught as { details?: { validationRetries?: number } }).details;
+    expect(details?.validationRetries).toBe(2);
+  });
+
+  it('a clean failure reports no repairs', async () => {
+    const { provider } = makeProvider([
+      { status: 401, body: { error: { message: 'Invalid API Key' } } },
+    ]);
+    let caught: unknown;
+    try {
+      await provider.generateStructured(buildRequest());
+    } catch (error) {
+      caught = error;
+    }
+    const details = (caught as { details?: { validationRetries?: number } }).details;
+    expect(details?.validationRetries).toBe(0);
+  });
+});
+
 describe('request shape', () => {
   it('sends strict json_schema with our sanitised schema', async () => {
     const { provider, recorder } = makeProvider([chatOk(validProposal())]);

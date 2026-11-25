@@ -63,6 +63,13 @@ const ConfigSchema = z.object({
   MODEL_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
   REQUEST_TIMEOUT_MS: positiveInt.default(90_000),
 
+  /**
+   * Hard ceiling for one request's prompt + reserved output. Leave unset and
+   * the provider's x-ratelimit-limit-tokens header supplies it after the
+   * first call. Set it to skip that first blind request.
+   */
+  PROVIDER_MAX_TOKENS_PER_REQUEST: positiveInt.nullable().default(null),
+
   ENABLE_AUTONOMOUS_BUILD: booleanish.default(false),
 
   RUNS_DIR: z.string().default('./runs'),

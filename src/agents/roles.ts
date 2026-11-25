@@ -60,7 +60,9 @@ export const ROLE_DEFINITIONS: Readonly<Record<AgentRole, RoleDefinition>> = {
     allowed_tools: [],
     input_contract: 'ProjectContextV1',
     output_contract: 'TechLeadSynthesisV1',
-    max_calls_per_meeting: 2,
+    // Round 3 is two calls (decisions, then requirement dispositions), so the
+    // budget is 3 rather than 2 to leave one spare.
+    max_calls_per_meeting: 3,
     core: true,
     mandate:
       'Resolve technical conflict and record decisions. You pick the approach and you own the ' +

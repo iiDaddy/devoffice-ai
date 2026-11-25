@@ -50,6 +50,14 @@ export interface GroqProviderOptions {
   readonly maxTransportRetries?: number;
   readonly maxSchemaRepairs?: number;
   readonly quotaExhaustedThresholdMs?: number;
+  /**
+   * Hard ceiling for ONE request's prompt + reserved output.
+   *
+   * On a free tier this is the per-minute token allowance, because a single
+   * request is checked against it. Left unset, the provider's own
+   * x-ratelimit-limit-tokens header supplies it after the first call.
+   */
+  readonly maxTokensPerRequest?: number;
   readonly throttle: RequestThrottle;
   readonly clock?: Clock;
   readonly backoff?: BackoffOptions;
@@ -159,7 +167,31 @@ export class GroqProvider implements ModelProvider {
     let transportAttempts = 0;
     const maxRepairs = this.options.maxSchemaRepairs ?? 2;
 
+    try {
+      return await this.repairLoop(request, messages, startedAt, maxRepairs, (v, t) => {
+        validationRetries = v;
+        transportAttempts = t;
+      });
+    } catch (error) {
+      // Attach the work already spent. Without this a call that repaired
+      // twice and then died reported "0 repairs", which is the under-counting
+      // this project treats as a correctness bug, not a cosmetic one.
+      throw attachAttemptCounts(error, validationRetries, transportAttempts);
+    }
+  }
+
+  private async repairLoop<T>(
+    request: ModelRequest<T>,
+    messages: ChatMessage[],
+    startedAt: number,
+    maxRepairs: number,
+    report: (validationRetries: number, transportAttempts: number) => void,
+  ): Promise<ModelResponse<T>> {
+    let validationRetries = 0;
+    let transportAttempts = 0;
+
     for (let repair = 0; repair <= maxRepairs; repair += 1) {
+      report(validationRetries, transportAttempts);
       const estimated = estimateTokens(messages) + request.maxOutputTokens;
 
       let raw: { content: string; usage: ModelUsage; requestId: string | null };
@@ -177,6 +209,7 @@ export class GroqProvider implements ModelProvider {
             },
           );
           transportAttempts += result.attempts;
+          report(validationRetries, transportAttempts);
           reconcile(result.value.usage.totalTokens);
           return result.value;
         });
@@ -188,6 +221,7 @@ export class GroqProvider implements ModelProvider {
         // and ask again, within the same repair budget.
         transportAttempts += 1;
         validationRetries += 1;
+        report(validationRetries, transportAttempts);
         const issues = [`schema check failed: ${error.details.issue}`];
 
         if (repair === maxRepairs) {
@@ -216,6 +250,7 @@ export class GroqProvider implements ModelProvider {
       const parsed = parseJsonLoosely(raw.content);
       if (!parsed.ok) {
         validationRetries += 1;
+        report(validationRetries, transportAttempts);
         if (repair === maxRepairs) {
           throw new DevOfficeError(
             'SCHEMA_INVALID',
@@ -253,6 +288,7 @@ export class GroqProvider implements ModelProvider {
         (issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`,
       );
       validationRetries += 1;
+      report(validationRetries, transportAttempts);
 
       if (repair === maxRepairs) {
         throw new DevOfficeError(
@@ -323,11 +359,42 @@ export class GroqProvider implements ModelProvider {
     };
   }
 
+  /**
+   * Refuse a request we can already see is too big, before spending a call.
+   *
+   * Groq counts prompt + max_completion_tokens against the PER-MINUTE token
+   * ceiling for a single request, which is not obvious: benchmark B3 died on
+   * "Limit 8000, Requested 8280" after two successful repair attempts, having
+   * spent all three. The local throttle could not prevent it - that paces how
+   * often we send, not how large one request is.
+   *
+   * The ceiling is learned from the provider's own header rather than
+   * configured, so it stays right when the account's tier changes.
+   */
+  private assertRequestFits(messages: readonly ChatMessage[], maxOutputTokens: number): void {
+    const ceiling = this.options.maxTokensPerRequest ?? this.snapshot?.limitTokens ?? null;
+    if (ceiling === null) return;
+
+    const estimated = estimateTokens(messages) + maxOutputTokens;
+    if (estimated <= ceiling) return;
+
+    throw new DevOfficeError(
+      'PAYLOAD_TOO_LARGE',
+      `This request needs about ${estimated} tokens (roughly ` +
+        `${estimated - maxOutputTokens} of prompt plus ${maxOutputTokens} reserved for the ` +
+        `answer) and the provider allows ${ceiling} in one request. ` +
+        'Lower MODEL_MAX_OUTPUT_TOKENS, send less context, or split the step into two calls. ' +
+        'Nothing was sent, so no quota was spent.',
+      { retryable: false, details: { estimated, ceiling } },
+    );
+  }
+
   private async postChatCompletion<T>(
     messages: readonly ChatMessage[],
     maxOutputTokens: number,
     request: ModelRequest<T> | null,
   ): Promise<{ content: string; usage: ModelUsage; requestId: string | null }> {
+    this.assertRequestFits(messages, maxOutputTokens);
     const tokensField = this.options.maxTokensField ?? 'max_completion_tokens';
     const mode = this.options.structuredMode ?? 'json_schema';
 
@@ -498,6 +565,32 @@ function isProviderValidationError(error: unknown): error is DevOfficeError & { 
     error.details !== null &&
     (error.details as { providerValidation?: unknown }).providerValidation === true
   );
+}
+
+/**
+ * Re-throw an error carrying how many attempts it cost.
+ *
+ * DevOfficeError is immutable, so this builds a copy with the counts merged
+ * into details. Callers read them to record truthful usage on a failed call.
+ */
+function attachAttemptCounts(
+  error: unknown,
+  validationRetries: number,
+  transportAttempts: number,
+): unknown {
+  if (!(error instanceof DevOfficeError)) return error;
+  const existing =
+    typeof error.details === 'object' && error.details !== null
+      ? (error.details as Record<string, unknown>)
+      : {};
+  return new DevOfficeError(error.code, error.message, {
+    retryable: error.retryable,
+    retryAfterMs: error.retryAfterMs,
+    httpStatus: error.httpStatus,
+    correlationId: error.correlationId,
+    details: { ...existing, validationRetries, transportAttempts },
+    cause: error,
+  });
 }
 
 /** Groq's wording when strict output was cut off by max_completion_tokens. */

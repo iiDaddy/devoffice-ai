@@ -24,7 +24,11 @@
 import { DevOfficeError, isDevOfficeError } from '../shared/errors.js';
 import type { AppConfig } from '../shared/config.js';
 import type { EventLog, RunEvent } from '../shared/events.js';
-import type { AgentContributionV1 } from '../shared/schemas.js';
+import type {
+  AgentContributionV1,
+  RequirementDispositionSetV1,
+  TechLeadDecisionsV1,
+} from '../shared/schemas.js';
 import {
   ArchitectureDecisionV1,
   type AgentRole,
@@ -38,9 +42,10 @@ import type { ModelProvider } from '../providers/types.js';
 import { ROLE_DEFINITIONS, selectRoster } from '../agents/roles.js';
 import { buildSystemInstruction, buildUserPayload } from '../agents/prompts.js';
 import {
+  DECISIONS_CONTRACT,
+  dispositionsContract,
   PROPOSAL_CONTRACT,
   reactionContract,
-  synthesisContract,
 } from '../agents/contribution-contracts.js';
 
 /* ------------------------------------------------------------------ *
@@ -128,6 +133,23 @@ function digestProposal(contribution: AgentContributionV1): Record<string, unkno
     summary: contribution.summary,
     rationale: contribution.rationale,
     risks: contribution.risks,
+    severity: contribution.severity,
+  };
+}
+
+/**
+ * Round-3 view of a proposal: headline only, no rationale.
+ *
+ * The full digest is ~4x larger, and round 3 is the step that ran out of
+ * room. What the Tech Lead needs is what was proposed and what was disputed -
+ * the reactions already carry the disputed parts verbatim in their evidence.
+ */
+function digestProposalBrief(contribution: AgentContributionV1): Record<string, unknown> {
+  return {
+    proposal_id: contribution.proposal_id,
+    agent_role: contribution.agent_role,
+    topic: contribution.topic,
+    summary: contribution.summary,
     severity: contribution.severity,
   };
 }
@@ -261,6 +283,7 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
           round: params.round,
           projectId,
           meetingId,
+          outputContract: params.contract.schemaName,
         }),
         input: params.input,
         // Untrusted brief text is fenced here, not in the provider.
@@ -319,6 +342,14 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
         ? error
         : new DevOfficeError('PROVIDER_UNAVAILABLE', String((error as Error)?.message ?? error));
 
+      // The provider attaches what the failed call actually cost. Without
+      // this a call that repaired twice then died recorded zero repairs.
+      const spent =
+        typeof wrapped.details === 'object' && wrapped.details !== null
+          ? (wrapped.details as { validationRetries?: number; transportAttempts?: number })
+          : {};
+      validationRetries = spent.validationRetries ?? validationRetries;
+
       eventLog.recordUsage({
         role: params.role,
         purpose: params.purpose,
@@ -328,7 +359,7 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
         completion_tokens: null,
         total_tokens: null,
         latency_ms: Date.now() - startedAt,
-        transport_attempts: 1,
+        transport_attempts: Math.max(1, spent.transportAttempts ?? 1),
         validation_retries: validationRetries,
         status: 'failed',
         error_code: wrapped.code,
@@ -440,29 +471,63 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
       });
       say('Round 3 - decision synthesis');
 
-      // Every requirement the PM raised must come back with a disposition.
-      // Built from this meeting's actual ids so a skipped one fails validation
-      // rather than passing unnoticed.
       const requirementIds = requirements.requirements.map((r) => r.id);
 
-      synthesis = await contribute<TechLeadSynthesisV1>({
-        key: `${runId}:r3:synthesis:tech_lead`,
+      // 3a: the verdict and the decisions. Proposals are passed WITHOUT their
+      // full rationale here - the Tech Lead has the reactions, which quote the
+      // parts under dispute, and every token of prompt is a token unavailable
+      // for the answer inside the same per-request ceiling.
+      const decisions = await contribute<TechLeadDecisionsV1>({
+        key: `${runId}:r3a:decisions:tech_lead`,
         role: 'tech_lead',
         round: 3,
         purpose: 'decision',
-        contract: synthesisContract(requirementIds),
+        contract: DECISIONS_CONTRACT,
         input: {
           brief_summary: { title: brief.title, objective: brief.objective, constraints: brief.constraints },
           requirements: digestRequirements(requirements),
-          requirement_ids: requirementIds,
-          proposals: proposals.map(digestProposal),
+          proposals: proposals.map(digestProposalBrief),
           reactions: reactions.map(digestReaction),
         },
         describe: (data) =>
           `Tech Lead verdict: ${data.verdict.toUpperCase()} - ${data.decisions.length} decisions, ` +
-          `${data.requirement_dispositions.length} requirements accounted for, ` +
           `${data.unresolved_blockers.filter((b) => b.blocking).length} blocking questions`,
       });
+
+      // 3b: account for every requirement against those decisions. A small
+      // prompt by design - requirement ids and decision headlines, nothing else.
+      const dispositionSet = await contribute<RequirementDispositionSetV1>({
+        key: `${runId}:r3b:dispositions:tech_lead`,
+        role: 'tech_lead',
+        round: 3,
+        purpose: 'decision',
+        contract: dispositionsContract(
+          requirementIds,
+          decisions.decisions.map((d) => d.decision_id),
+        ),
+        input: {
+          requirements: requirements.requirements.map((r) => ({
+            id: r.id,
+            statement: r.statement,
+            priority: r.priority,
+          })),
+          decisions_available: decisions.decisions.map((d) => ({
+            decision_id: d.decision_id,
+            problem: d.problem,
+            selected: d.selected,
+          })),
+          open_blockers: decisions.unresolved_blockers.map((b) => b.question),
+        },
+        describe: (data) => {
+          const settled = data.requirement_dispositions.filter((d) => d.status === 'decided').length;
+          return (
+            `Tech Lead accounted for ${data.requirement_dispositions.length} requirements ` +
+            `(${settled} decided, ${data.requirement_dispositions.length - settled} not settled)`
+          );
+        },
+      });
+
+      synthesis = { ...decisions, requirement_dispositions: dispositionSet.requirement_dispositions };
 
       for (const decision of synthesis.decisions) {
         // Validate each ADR with the refined schema, which enforces

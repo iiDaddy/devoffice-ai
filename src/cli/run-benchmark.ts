@@ -64,6 +64,9 @@ function buildProvider(
     maxTransportRetries: config.MODEL_REQUEST_MAX_RETRIES,
     maxSchemaRepairs: config.SCHEMA_REPAIR_MAX_RETRIES,
     quotaExhaustedThresholdMs: config.QUOTA_EXHAUSTED_THRESHOLD_MS,
+    ...(config.PROVIDER_MAX_TOKENS_PER_REQUEST !== null
+      ? { maxTokensPerRequest: config.PROVIDER_MAX_TOKENS_PER_REQUEST }
+      : {}),
     throttle,
     onRetry: ({ attempt, waitMs, code }) =>
       onProgress(`  [retry ${attempt}] ${code} - waiting ${waitMs}ms`),
