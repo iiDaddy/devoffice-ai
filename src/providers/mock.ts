@@ -109,6 +109,7 @@ interface TemplateInput {
   readonly brief?: { title?: string; objective?: string; requested_features?: string[] };
   readonly brief_summary?: { title?: string; objective?: string };
   readonly target_proposals?: Array<{ proposal_id?: string; agent_role?: string; summary?: string }>;
+  readonly requirement_ids?: string[];
 }
 
 function buildTemplate<T>(request: ModelRequest<T>): unknown {
@@ -161,11 +162,17 @@ function buildTemplate<T>(request: ModelRequest<T>): unknown {
       };
     }
 
-    case 'TechLeadSynthesisV1':
+    case 'TechLeadSynthesisV1': {
+      const requirementIds = input.requirement_ids ?? ['REQ-001'];
       return {
         consensus_summary:
           '[SIMULATED PLACEHOLDER] Template synthesis produced without model reasoning; ' +
           'present only to validate the round-3 contract and event sequence.',
+        verdict: 'proceed_with_conditions',
+        verdict_justification:
+          '[SIMULATED PLACEHOLDER] Verdict chosen by template, not by analysis. It exists to ' +
+          'exercise the contract and must not be read as advice.',
+        verdict_conditions: ['[SIMULATED] placeholder condition that must hold first'],
         decisions: [
           {
             decision_id: 'adr-001',
@@ -183,7 +190,22 @@ function buildTemplate<T>(request: ModelRequest<T>): unknown {
             open_questions: [],
           },
         ],
-        changed_due_to_feedback: ['[SIMULATED] nothing genuinely changed; this is a template run'],
+        requirement_dispositions: requirementIds.map((id, index) => ({
+          requirement_id: id,
+          status: index === 0 ? 'decided' : 'deferred',
+          decision_id: index === 0 ? 'adr-001' : null,
+          note: '[SIMULATED] placeholder disposition note for this requirement.',
+        })),
+        changed_due_to_feedback: [
+          {
+            decision_id: 'adr-001',
+            triggered_by_role: 'security',
+            related_proposal_id: null,
+            previous_position: '[SIMULATED] the earlier placeholder position',
+            revised_position: '[SIMULATED] the later placeholder position',
+            why: '[SIMULATED] placeholder reason of at least twenty-five characters.',
+          },
+        ],
         unresolved_blockers: [
           {
             question: '[SIMULATED] Which contact channel should the form deliver to?',
@@ -193,6 +215,7 @@ function buildTemplate<T>(request: ModelRequest<T>): unknown {
           },
         ],
       };
+    }
 
     default:
       throw new DevOfficeError(

@@ -15,6 +15,7 @@ import {
 import { buildGroqJsonSchema, findStrictViolations } from '../src/shared/json-schema.js';
 import { PROPOSAL_CONTRACT, reactionContract } from '../src/agents/contribution-contracts.js';
 import { BENCHMARK_BRIEFS } from '../src/benchmarks/briefs.js';
+import { loadConfig } from '../src/shared/config.js';
 import { validProposal } from './helpers.js';
 
 describe('Groq strict-mode schema guard', () => {
@@ -233,6 +234,31 @@ describe('ArchitectureDecisionV1 (LLD 6.3)', () => {
       ],
     });
     expect(result.success).toBe(false);
+  });
+});
+
+describe('configuration', () => {
+  it('treats a blank env var as unset, not as an invalid value', () => {
+    // "GROQ_MODEL_PLANNING=" in a .env file is how a human says "not chosen
+    // yet". If that were a validation error, `npm run models` - the command
+    // that tells you what to choose - could never run.
+    const config = loadConfig({
+      GROQ_API_KEY: 'gsk_fake_for_test',
+      GROQ_MODEL_PLANNING: '',
+    } as NodeJS.ProcessEnv);
+    expect(config.GROQ_MODEL_PLANNING).toBeNull();
+    expect(config.GROQ_API_KEY).toBe('gsk_fake_for_test');
+  });
+
+  it('falls back to defaults when a numeric setting is left blank', () => {
+    const config = loadConfig({ MEETING_MAX_ROUNDS: '' } as NodeJS.ProcessEnv);
+    expect(config.MEETING_MAX_ROUNDS).toBe(3);
+  });
+
+  it('still rejects a value that is present but genuinely wrong', () => {
+    expect(() =>
+      loadConfig({ MEETING_MAX_ROUNDS: 'banana' } as NodeJS.ProcessEnv),
+    ).toThrowError(/Invalid environment configuration/);
   });
 });
 

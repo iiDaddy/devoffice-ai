@@ -174,6 +174,51 @@ describe('three-round meeting (LLD 7)', () => {
     expect(log.readAll().some((e) => e.event_type === 'meeting_completed')).toBe(false);
   });
 
+  it('lists each blocking question once, even when PM and Tech Lead both raise it', async () => {
+    const dir = freshDir();
+    const log = new EventLog({ runsDir: dir, runId: 'run-dedupe', projectId: 'p1' });
+
+    // The template provider has the PM and the Tech Lead raise the same
+    // contact-channel question, which is exactly what happened on real B1.
+    const result = await runMeeting({
+      provider: new MockProvider(),
+      eventLog: log,
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-dedupe',
+    });
+
+    const normalised = result.blockingQuestions.map((q) => q.toLowerCase());
+    expect(new Set(normalised).size).toBe(normalised.length);
+    expect(result.blockingQuestions.length).toBeGreaterThan(0);
+  });
+
+  it('counts attempted calls separately from successful ones', async () => {
+    const dir = freshDir();
+    const log = new EventLog({ runsDir: dir, runId: 'run-attempts', projectId: 'p1' });
+    const failing = new FailAfterProvider(
+      2,
+      new DevOfficeError('OUTPUT_TRUNCATED', 'cut off', { retryable: false }),
+    );
+
+    const result = await runMeeting({
+      provider: failing,
+      eventLog: log,
+      config: testConfig(),
+      brief: getBrief('b1-portfolio').brief,
+      projectId: 'p1',
+      meetingId: 'm1',
+      runId: 'run-attempts',
+    });
+
+    expect(result.state).toBe('BLOCKED');
+    expect(result.errorCode).toBe('OUTPUT_TRUNCATED');
+    expect(result.modelCalls).toBe(1);
+    expect(result.modelAttempts).toBe(2);
+  });
+
   it('honours MEETING_MAX_ROUNDS=1 and skips the later rounds', async () => {
     const dir = freshDir();
     const log = new EventLog({ runsDir: dir, runId: 'run-d', projectId: 'p1' });

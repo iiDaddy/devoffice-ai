@@ -35,6 +35,17 @@ export const ContributionType = z.enum([
   'support',
   'revision',
   'question',
+  /**
+   * "This should not be built as scoped, and here is why."
+   *
+   * Added after benchmark B3. The student-payment brief was meant to be
+   * refused, and the team never refused - but the contract had no way to say
+   * it. The only options were propose, object, support, revise and ask. An
+   * objection says "fix this part"; nothing said "step back from the whole
+   * thing". Roles used the tool they had and used it well, so the gap was in
+   * this enum, not in their judgement.
+   */
+  'recommend_against',
 ]);
 export type ContributionType = z.infer<typeof ContributionType>;
 
@@ -127,10 +138,42 @@ export const AgentContributionV1Base = z.object({
  *   - a rationale that is only "I agree" is rejected
  */
 export const AgentContributionV1 = AgentContributionV1Base.superRefine((value, ctx) => {
+  // recommend_against is about the project, not about one colleague's
+  // proposal, so it is the one reaction that needs no citation.
   const needsReference =
     value.contribution_type === 'objection' ||
     value.contribution_type === 'support' ||
     value.contribution_type === 'revision';
+
+  if (value.contribution_type === 'recommend_against') {
+    if (value.evidence.length === 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['evidence'],
+        message:
+          'recommending against a project requires evidence from the brief - name the ' +
+          'specific features or constraints that make it unsafe to scope',
+      });
+    }
+    if (value.recommended_change === null || value.recommended_change.trim() === '') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['recommended_change'],
+        message:
+          'say what should happen instead: a reduced scope, a prerequisite to obtain first, ' +
+          'or a different approach. "Do not build it" alone is not actionable',
+      });
+    }
+    if (value.severity !== 'high' && value.severity !== 'critical') {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['severity'],
+        message:
+          `severity "${value.severity}" contradicts recommending against the project. ` +
+          'Use high or critical, or choose objection instead',
+      });
+    }
+  }
 
   if (needsReference && (value.related_proposal_id === null || value.related_proposal_id.trim() === '')) {
     ctx.addIssue({
@@ -245,14 +288,141 @@ export const BlockerV1 = z.object({
 });
 export type BlockerV1 = z.infer<typeof BlockerV1>;
 
-export const TechLeadSynthesisV1 = z.object({
+/* ------------------------------------------------------------------ *
+ * Tech Lead verdict on the project as a whole
+ * ------------------------------------------------------------------ */
+
+export const ProjectVerdict = z.enum([
+  /** Nothing in the way beyond the usual open questions. */
+  'proceed',
+  /** Safe only if the listed conditions are met first. */
+  'proceed_with_conditions',
+  /** Should not be scoped as described. The owner decides what happens next. */
+  'do_not_proceed',
+]);
+export type ProjectVerdict = z.infer<typeof ProjectVerdict>;
+
+/* ------------------------------------------------------------------ *
+ * Every important requirement must be accounted for
+ * ------------------------------------------------------------------ */
+
+export const RequirementStatus = z.enum([
+  /** A decision record covers it. decision_id must name which. */
+  'decided',
+  /** Deliberately left for later, with a reason. */
+  'deferred',
+  /** Cannot be settled until a blocker is answered. */
+  'blocked',
+  /** Judged outside what this project should do. */
+  'out_of_scope',
+]);
+
+export const RequirementDispositionV1 = z.object({
+  requirement_id: z.string().min(3),
+  status: RequirementStatus,
+  /** The ADR that settles it. Required when status is "decided". */
+  decision_id: z.string().min(3).nullable(),
+  note: z.string().min(15),
+});
+export type RequirementDispositionV1 = z.infer<typeof RequirementDispositionV1>;
+
+/* ------------------------------------------------------------------ *
+ * What round 2 actually changed
+ * ------------------------------------------------------------------ */
+
+/**
+ * Structured on purpose.
+ *
+ * This was a flat array of strings with a 10-character minimum, and on
+ * benchmark B3 it produced four lines of this shape:
+ *
+ *     "Decision DEC-001 updated based on round-2 feedback"
+ *
+ * Which says that something changed and nothing about what. A length rule
+ * produces length. Naming the position before and the position after makes
+ * the empty version impossible to write: there is nowhere to put the filler.
+ */
+export const DecisionChangeV1 = z.object({
+  decision_id: z.string().min(3),
+  triggered_by_role: AgentRole,
+  related_proposal_id: z.string().min(3).nullable(),
+  /** What the plan said before round 2. */
+  previous_position: z.string().min(15),
+  /** What it says now. */
+  revised_position: z.string().min(15),
+  /** The argument that moved it. */
+  why: z.string().min(25),
+});
+export type DecisionChangeV1 = z.infer<typeof DecisionChangeV1>;
+
+export const TechLeadSynthesisV1Base = z.object({
   consensus_summary: z.string().min(40),
+  verdict: ProjectVerdict,
+  verdict_justification: z.string().min(40),
+  /** Required when the verdict is not a plain "proceed". */
+  verdict_conditions: z.array(z.string().min(10)),
   decisions: z.array(ArchitectureDecisionV1Base),
-  /** What actually changed because of round-2 feedback. Empty = nothing changed. */
-  changed_due_to_feedback: z.array(z.string().min(10)),
+  /** One entry per important requirement. Nothing may go unmentioned. */
+  requirement_dispositions: z.array(RequirementDispositionV1),
+  changed_due_to_feedback: z.array(DecisionChangeV1),
   unresolved_blockers: z.array(BlockerV1),
 });
-export type TechLeadSynthesisV1 = z.infer<typeof TechLeadSynthesisV1>;
+
+export const TechLeadSynthesisV1 = TechLeadSynthesisV1Base.superRefine((value, ctx) => {
+  if (value.verdict !== 'proceed' && value.verdict_conditions.length === 0) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['verdict_conditions'],
+      message:
+        `verdict "${value.verdict}" must list what has to be true before this project is safe ` +
+        'to proceed. An empty list means the verdict cannot be acted on',
+    });
+  }
+
+  const decisionIds = new Set(value.decisions.map((d) => d.decision_id));
+
+  value.changed_due_to_feedback.forEach((change, index) => {
+    if (!decisionIds.has(change.decision_id)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['changed_due_to_feedback', index, 'decision_id'],
+        message:
+          `"${change.decision_id}" is not one of the decisions you recorded ` +
+          `(${[...decisionIds].join(', ') || 'none'})`,
+      });
+    }
+    if (
+      change.previous_position.trim().toLowerCase() === change.revised_position.trim().toLowerCase()
+    ) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['changed_due_to_feedback', index, 'revised_position'],
+        message: 'previous_position and revised_position are identical, so nothing changed',
+      });
+    }
+  });
+
+  value.requirement_dispositions.forEach((disposition, index) => {
+    if (disposition.status === 'decided') {
+      if (disposition.decision_id === null) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['requirement_dispositions', index, 'decision_id'],
+          message: 'status "decided" must name the decision record that settles it',
+        });
+      } else if (!decisionIds.has(disposition.decision_id)) {
+        ctx.addIssue({
+          code: 'custom',
+          path: ['requirement_dispositions', index, 'decision_id'],
+          message:
+            `"${disposition.decision_id}" is not one of the decisions you recorded ` +
+            `(${[...decisionIds].join(', ') || 'none'})`,
+        });
+      }
+    }
+  });
+});
+export type TechLeadSynthesisV1 = z.infer<typeof TechLeadSynthesisV1Base>;
 
 /* ------------------------------------------------------------------ *
  * Registry so the CLI and tests can look schemas up by name
@@ -263,7 +433,7 @@ export const SCHEMA_REGISTRY = {
   RequirementSetV1,
   AgentContributionV1: AgentContributionV1Base,
   ArchitectureDecisionV1: ArchitectureDecisionV1Base,
-  TechLeadSynthesisV1,
+  TechLeadSynthesisV1: TechLeadSynthesisV1Base,
 } as const;
 
 export type SchemaName = keyof typeof SCHEMA_REGISTRY;

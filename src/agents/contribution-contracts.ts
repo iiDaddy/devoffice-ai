@@ -20,11 +20,17 @@
  * ids, and asked again. No new error path, no silent acceptance.
  */
 import { z } from 'zod';
-import { AgentContributionV1, AgentContributionV1Base } from '../shared/schemas.js';
+import {
+  AgentContributionV1,
+  AgentContributionV1Base,
+  TechLeadSynthesisV1,
+  TechLeadSynthesisV1Base,
+} from '../shared/schemas.js';
 import { buildGroqJsonSchema } from '../shared/json-schema.js';
 import type { StructuredContract } from '../providers/types.js';
 
 const CONTRIBUTION_WIRE = buildGroqJsonSchema('AgentContributionV1', AgentContributionV1Base);
+const SYNTHESIS_WIRE = buildGroqJsonSchema('TechLeadSynthesisV1', TechLeadSynthesisV1Base);
 
 function contractFor(
   validator: z.ZodType<z.infer<typeof AgentContributionV1>>,
@@ -37,16 +43,23 @@ function contractFor(
   };
 }
 
-/** Round 1: an independent proposal, citing nobody. */
+/**
+ * Round 1: an independent proposal, citing nobody.
+ *
+ * recommend_against is allowed here too. A specialist who reads the brief and
+ * concludes the project should not be scoped as described must be able to say
+ * so immediately, rather than being made to propose a design first and object
+ * to it afterwards.
+ */
 export const PROPOSAL_CONTRACT = contractFor(
   AgentContributionV1.superRefine((value, ctx) => {
-    if (value.contribution_type !== 'proposal') {
+    if (value.contribution_type !== 'proposal' && value.contribution_type !== 'recommend_against') {
       ctx.addIssue({
         code: 'custom',
         path: ['contribution_type'],
         message:
-          `round 1 is an independent proposal, so contribution_type must be "proposal", ` +
-          `not "${value.contribution_type}"`,
+          'round 1 is independent assessment: use "proposal", or "recommend_against" if this ' +
+          `project should not be scoped as described. Not "${value.contribution_type}"`,
       });
     }
   }),
@@ -75,7 +88,11 @@ export function reactionContract(
         return;
       }
 
-      if (value.contribution_type === 'question') return;
+      // A question needs no citation, and neither does recommending against
+      // the project - that is about the brief, not about a colleague.
+      if (value.contribution_type === 'question' || value.contribution_type === 'recommend_against') {
+        return;
+      }
 
       if (value.related_proposal_id === null || !known.has(value.related_proposal_id)) {
         ctx.addIssue({
@@ -88,4 +105,60 @@ export function reactionContract(
       }
     }),
   );
+}
+
+
+/**
+ * Round 3: the Tech Lead's synthesis, checked against the requirements that
+ * actually exist in this meeting.
+ *
+ * `mustRequirementIds` comes from the PM's output, so "every must-requirement
+ * is accounted for" becomes a machine check rather than a hope. On benchmark
+ * B3 the riskiest requirement in the brief - finance staff being able to read
+ * ANY student's record - received no decision at all. Security flagged it as
+ * an insider risk and the synthesis simply never mentioned it. Nothing caught
+ * that, because nothing was looking.
+ *
+ * Now a missing requirement fails validation and the repair loop hands the
+ * model the exact list of ids it skipped.
+ */
+export function synthesisContract(
+  mustRequirementIds: readonly string[],
+): StructuredContract<z.infer<typeof TechLeadSynthesisV1>> {
+  const required = [...new Set(mustRequirementIds)];
+
+  const validator = TechLeadSynthesisV1.superRefine((value, ctx) => {
+    const covered = new Set(value.requirement_dispositions.map((d) => d.requirement_id));
+    const missing = required.filter((id) => !covered.has(id));
+
+    if (missing.length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['requirement_dispositions'],
+        message:
+          'every important requirement needs an entry, even if only to say it is deferred or ' +
+          `blocked. Missing: ${missing.join(', ')}`,
+      });
+    }
+
+    const unknown = value.requirement_dispositions
+      .map((d) => d.requirement_id)
+      .filter((id) => !required.includes(id));
+    if (unknown.length > 0) {
+      ctx.addIssue({
+        code: 'custom',
+        path: ['requirement_dispositions'],
+        message:
+          `these requirement ids do not exist in this meeting: ${unknown.join(', ')}. ` +
+          `The ids are: ${required.join(', ')}`,
+      });
+    }
+  });
+
+  return {
+    schemaName: 'TechLeadSynthesisV1',
+    validator,
+    jsonSchema: SYNTHESIS_WIRE.jsonSchema,
+    strippedKeywords: SYNTHESIS_WIRE.strippedKeywords,
+  };
 }

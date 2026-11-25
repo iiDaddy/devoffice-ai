@@ -25,6 +25,12 @@ export type ErrorCode =
   | 'SERVER_ERROR'
   /** Model returned JSON that failed Zod validation after all repair attempts. */
   | 'SCHEMA_INVALID'
+  /**
+   * The answer was cut off at MODEL_MAX_OUTPUT_TOKENS before it was complete.
+   * Not retryable as-is: the same budget produces the same cut. The fix is a
+   * configuration change, and the message says which one.
+   */
+  | 'OUTPUT_TRUNCATED'
   /** Model explicitly refused to answer. Not a transport problem. */
   | 'MODEL_REFUSED'
   /** Operator or owner cancelled the run. */
@@ -84,6 +90,7 @@ const DEFAULT_RETRYABLE: Record<ErrorCode, boolean> = {
   PROVIDER_UNAVAILABLE: true,
   SERVER_ERROR: true,
   SCHEMA_INVALID: false,
+  OUTPUT_TRUNCATED: false,
   MODEL_REFUSED: false,
   CANCELLED: false,
   CONFIG_INVALID: false,

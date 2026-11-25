@@ -136,7 +136,12 @@ async function runOne(
   writeFileSync(reportPath, markdown, 'utf8');
 
   console.log(`\nTerminal state : ${result.state}`);
-  console.log(`Model calls    : ${result.modelCalls} (replayed ${result.replayedFromLog})`);
+  if (result.verdict !== null) console.log(`Team verdict   : ${result.verdict}`);
+  if (result.recommendedAgainstBy.length > 0) {
+    console.log(`Recommended against by: ${result.recommendedAgainstBy.join(', ')}`);
+  }
+  console.log(`Model calls    : ${result.modelAttempts} attempted, ${result.modelCalls} succeeded ` +
+    `(replayed ${result.replayedFromLog} from log)`);
   console.log(`Events         : ${events.length} -> ${eventLog.directory}/events.jsonl`);
   console.log(`Reported tokens: prompt=${signals.usage.reportedPromptTokens ?? 'not reported'}, ` +
     `completion=${signals.usage.reportedCompletionTokens ?? 'not reported'}`);
@@ -146,6 +151,7 @@ async function runOne(
 
   if (result.state === 'BLOCKED') {
     console.log(`\nThis run is BLOCKED (${result.errorCode}) but NOT lost.`);
+    if (result.errorMessage !== null) console.log(`Reason: ${result.errorMessage}`);
     console.log(`Resume with:  npm run bench -- --brief=${brief.id} --run-id=${runId}`);
   }
 

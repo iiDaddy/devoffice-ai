@@ -32,13 +32,16 @@ import {
   type RequirementSetV1,
   RequirementSetV1 as RequirementSetSchema,
   type TechLeadSynthesisV1,
-  TechLeadSynthesisV1 as TechLeadSynthesisSchema,
 } from '../shared/schemas.js';
 import { defineContract } from '../providers/contracts.js';
 import type { ModelProvider } from '../providers/types.js';
 import { ROLE_DEFINITIONS, selectRoster } from '../agents/roles.js';
 import { buildSystemInstruction, buildUserPayload } from '../agents/prompts.js';
-import { PROPOSAL_CONTRACT, reactionContract } from '../agents/contribution-contracts.js';
+import {
+  PROPOSAL_CONTRACT,
+  reactionContract,
+  synthesisContract,
+} from '../agents/contribution-contracts.js';
 
 /* ------------------------------------------------------------------ *
  * Output contracts, built once (the strict-mode guard runs here)
@@ -50,18 +53,24 @@ const REQUIREMENTS_CONTRACT = defineContract<RequirementSetV1>(
   RequirementSetSchema,
 );
 
-const SYNTHESIS_CONTRACT = defineContract<TechLeadSynthesisV1>(
-  'TechLeadSynthesisV1',
-  TechLeadSynthesisSchema,
-  TechLeadSynthesisSchema,
-);
-
 /* ------------------------------------------------------------------ *
  * Types
  * ------------------------------------------------------------------ */
 
-/** Terminal states reachable in M0. SPEC_READY belongs to M3. */
-export type MeetingState = 'MEETING_COMPLETED' | 'NEEDS_INPUT' | 'BLOCKED';
+/**
+ * Terminal states reachable in M0. SPEC_READY belongs to M3.
+ *
+ * NEEDS_OWNER_DECISION is separate from BLOCKED on purpose. BLOCKED means the
+ * machinery stopped - quota, provider, a crash - and resuming continues. This
+ * one means the team did its work and concluded the project should not go
+ * ahead as scoped. Nothing technical is wrong, and resuming would change
+ * nothing: a person has to decide.
+ */
+export type MeetingState =
+  | 'MEETING_COMPLETED'
+  | 'NEEDS_INPUT'
+  | 'NEEDS_OWNER_DECISION'
+  | 'BLOCKED';
 
 export interface MeetingResult {
   readonly state: MeetingState;
@@ -75,7 +84,20 @@ export interface MeetingResult {
   readonly reactions: readonly AgentContributionV1[];
   readonly synthesis: TechLeadSynthesisV1 | null;
   readonly blockingQuestions: readonly string[];
+  /** The team's verdict on the project, when round 3 ran. */
+  readonly verdict: TechLeadSynthesisV1['verdict'] | null;
+  readonly verdictJustification: string | null;
+  readonly verdictConditions: readonly string[];
+  /** Roles that recommended against the project in rounds 1 or 2. */
+  readonly recommendedAgainstBy: readonly AgentRole[];
+  /** Model calls that returned a valid contribution. */
   readonly modelCalls: number;
+  /**
+   * Model calls actually made, successful or not. Reported separately because
+   * "0 calls" after a failed resume read as if nothing had been tried, when one
+   * call had been made, had failed, and had spent quota.
+   */
+  readonly modelAttempts: number;
   readonly replayedFromLog: number;
   readonly errorCode: string | null;
   readonly errorMessage: string | null;
@@ -135,6 +157,18 @@ function digestRequirements(requirements: RequirementSetV1): Record<string, unkn
   };
 }
 
+function uniqueQuestions(questions: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const question of questions) {
+    const key = question.trim().toLowerCase().replace(/\s+/g, ' ');
+    if (key === '' || seen.has(key)) continue;
+    seen.add(key);
+    out.push(question.trim());
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ *
  * The runner
  * ------------------------------------------------------------------ */
@@ -150,6 +184,7 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
   }
   let replayedFromLog = 0;
   let modelCalls = 0;
+  let modelAttempts = 0;
   let simulated = provider.simulated;
 
   const callsByRole = new Map<AgentRole, number>();
@@ -216,6 +251,7 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
     const startedAt = Date.now();
     let validationRetries = 0;
 
+    modelAttempts += 1;
     try {
       const response = await provider.generateStructured<T>({
         purpose: params.purpose,
@@ -404,20 +440,27 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
       });
       say('Round 3 - decision synthesis');
 
+      // Every requirement the PM raised must come back with a disposition.
+      // Built from this meeting's actual ids so a skipped one fails validation
+      // rather than passing unnoticed.
+      const requirementIds = requirements.requirements.map((r) => r.id);
+
       synthesis = await contribute<TechLeadSynthesisV1>({
         key: `${runId}:r3:synthesis:tech_lead`,
         role: 'tech_lead',
         round: 3,
         purpose: 'decision',
-        contract: SYNTHESIS_CONTRACT,
+        contract: synthesisContract(requirementIds),
         input: {
           brief_summary: { title: brief.title, objective: brief.objective, constraints: brief.constraints },
           requirements: digestRequirements(requirements),
+          requirement_ids: requirementIds,
           proposals: proposals.map(digestProposal),
           reactions: reactions.map(digestReaction),
         },
         describe: (data) =>
-          `Tech Lead recorded ${data.decisions.length} decisions, ` +
+          `Tech Lead verdict: ${data.verdict.toUpperCase()} - ${data.decisions.length} decisions, ` +
+          `${data.requirement_dispositions.length} requirements accounted for, ` +
           `${data.unresolved_blockers.filter((b) => b.blocking).length} blocking questions`,
       });
 
@@ -446,30 +489,57 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
     }
 
     /* ---------------- Completion gate (HLD 6.3) ---------------- */
-    const blockingQuestions = [
+    // PM raises questions in round 1 and the Tech Lead often carries the same
+    // ones forward in round 3. Listing both made every question appear twice
+    // in the B1 report, so duplicates are removed (case and spacing ignored,
+    // first wording kept).
+    const blockingQuestions = uniqueQuestions([
       ...(synthesis?.unresolved_blockers ?? []).filter((b) => b.blocking).map((b) => b.question),
       ...(requirements?.missing_questions ?? []),
-    ];
+    ]);
 
-    const state: MeetingState = blockingQuestions.length > 0 ? 'NEEDS_INPUT' : 'MEETING_COMPLETED';
+    const recommendedAgainstBy = [...proposals, ...reactions]
+      .filter((c) => c.contribution_type === 'recommend_against')
+      .map((c) => c.agent_role);
+
+    const verdict = synthesis?.verdict ?? null;
+
+    // A verdict of do_not_proceed outranks open questions: answering them
+    // would not change the team's position, so the owner decides first.
+    const state: MeetingState =
+      verdict === 'do_not_proceed' || recommendedAgainstBy.length > 0
+        ? 'NEEDS_OWNER_DECISION'
+        : blockingQuestions.length > 0
+          ? 'NEEDS_INPUT'
+          : 'MEETING_COMPLETED';
+
+    const terminalEventType =
+      state === 'MEETING_COMPLETED' ? 'meeting_completed' : 'needs_input';
 
     eventLog.append({
-      event_type: state === 'NEEDS_INPUT' ? 'needs_input' : 'meeting_completed',
+      event_type: terminalEventType,
       role: null,
       round: null,
       meeting_id: meetingId,
       idempotency_key: `${runId}:terminal:${state}`,
       payload_json: {
         state,
+        verdict,
+        verdict_justification: synthesis?.verdict_justification ?? null,
+        verdict_conditions: synthesis?.verdict_conditions ?? [],
+        recommended_against_by: recommendedAgainstBy,
         blocking_questions: blockingQuestions,
         model_calls: modelCalls,
+        model_attempts: modelAttempts,
         replayed_from_log: replayedFromLog,
         simulated,
       },
       display_text:
-        state === 'NEEDS_INPUT'
-          ? `Meeting paused: ${blockingQuestions.length} question(s) need the Product Owner`
-          : 'Meeting completed with no blocking questions',
+        state === 'NEEDS_OWNER_DECISION'
+          ? `Team recommends AGAINST proceeding as scoped - Product Owner must decide`
+          : state === 'NEEDS_INPUT'
+            ? `Meeting paused: ${blockingQuestions.length} question(s) need the Product Owner`
+            : 'Meeting completed with no blocking questions',
     });
 
     return {
@@ -484,7 +554,12 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
       reactions,
       synthesis,
       blockingQuestions,
+      verdict,
+      verdictJustification: synthesis?.verdict_justification ?? null,
+      verdictConditions: synthesis?.verdict_conditions ?? [],
+      recommendedAgainstBy,
       modelCalls,
+      modelAttempts,
       replayedFromLog,
       errorCode: null,
       errorMessage: null,
@@ -523,7 +598,14 @@ export async function runMeeting(options: MeetingOptions): Promise<MeetingResult
       reactions,
       synthesis,
       blockingQuestions: [],
+      verdict: synthesis?.verdict ?? null,
+      verdictJustification: synthesis?.verdict_justification ?? null,
+      verdictConditions: synthesis?.verdict_conditions ?? [],
+      recommendedAgainstBy: [...proposals, ...reactions]
+        .filter((c) => c.contribution_type === 'recommend_against')
+        .map((c) => c.agent_role),
       modelCalls,
+      modelAttempts,
       replayedFromLog,
       errorCode: wrapped.code,
       errorMessage: wrapped.message,

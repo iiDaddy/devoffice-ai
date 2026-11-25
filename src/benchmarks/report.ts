@@ -63,6 +63,17 @@ export interface SignalSet {
     readonly buildAttemptsRejected: number;
     readonly approvalEventsFound: number;
   };
+  readonly projectVerdict: {
+    readonly verdict: string | null;
+    readonly recommendedAgainstBy: readonly string[];
+    readonly conditionsListed: number;
+  };
+  readonly requirementCoverage: {
+    readonly requirements: number;
+    readonly withADisposition: number;
+    readonly settledByADecision: number;
+    readonly unaccountedFor: readonly string[];
+  };
   readonly quotaRecovery: {
     readonly blocked: boolean;
     readonly errorCode: string | null;
@@ -145,6 +156,10 @@ export function computeSignals(result: MeetingResult, usage: readonly UsageRecor
   const referenced = new Set(decisions.flatMap((d) => d.affected_requirements));
   const orphans = requirementIds.filter((id) => !referenced.has(id));
 
+  const dispositionIds = new Set(
+    (result.synthesis?.requirement_dispositions ?? []).map((d) => d.requirement_id),
+  );
+
   /* security / QA signal */
   const allContributions = [...result.proposals, ...result.reactions];
   const securityText = allContributions
@@ -200,6 +215,19 @@ export function computeSignals(result: MeetingResult, usage: readonly UsageRecor
       terminalState: result.state,
       buildAttemptsRejected: 0,
       approvalEventsFound: 0,
+    },
+    projectVerdict: {
+      verdict: result.verdict,
+      recommendedAgainstBy: result.recommendedAgainstBy,
+      conditionsListed: result.verdictConditions.length,
+    },
+    requirementCoverage: {
+      requirements: requirementIds.length,
+      withADisposition: requirementIds.filter((id) => dispositionIds.has(id)).length,
+      settledByADecision: (result.synthesis?.requirement_dispositions ?? []).filter(
+        (d) => d.status === 'decided',
+      ).length,
+      unaccountedFor: requirementIds.filter((id) => !dispositionIds.has(id)),
     },
     quotaRecovery: {
       blocked: result.state === 'BLOCKED',
@@ -266,7 +294,7 @@ export function renderMarkdownReport(options: {
   lines.push(`| Duration | ${(options.durationMs / 1000).toFixed(1)}s |`);
   lines.push(`| Terminal state | **${result.state}** |`);
   lines.push(`| Provider | ${result.simulated ? 'mock (SIMULATED)' : 'groq'} |`);
-  lines.push(`| Model calls made | ${result.modelCalls} |`);
+  lines.push(`| Model calls | ${result.modelAttempts} attempted, ${result.modelCalls} succeeded |`);
   lines.push(`| Replayed from log | ${result.replayedFromLog} |`);
   lines.push(`| Events persisted | ${options.eventCount} |`);
   lines.push(`| Event log | \`${options.eventsPath}\` |`);
@@ -274,6 +302,33 @@ export function renderMarkdownReport(options: {
     lines.push(`| Error | \`${result.errorCode}\` - ${result.errorMessage ?? ''} |`);
   }
   lines.push('');
+
+  if (result.verdict !== null) {
+    const label: Record<string, string> = {
+      proceed: 'PROCEED',
+      proceed_with_conditions: 'PROCEED WITH CONDITIONS',
+      do_not_proceed: 'DO NOT PROCEED',
+    };
+    lines.push(`## Team verdict: ${label[result.verdict] ?? result.verdict}`);
+    lines.push('');
+    if (result.verdictJustification !== null) {
+      lines.push(result.verdictJustification);
+      lines.push('');
+    }
+    if (result.verdictConditions.length > 0) {
+      lines.push('Must be true before work starts:');
+      lines.push('');
+      for (const condition of result.verdictConditions) lines.push(`- ${condition}`);
+      lines.push('');
+    }
+  }
+
+  if (result.recommendedAgainstBy.length > 0) {
+    lines.push(
+      `> Recommended against by: ${result.recommendedAgainstBy.map((r) => `\`${r}\``).join(', ')}`,
+    );
+    lines.push('');
+  }
 
   lines.push('## Roster decision (deterministic, not a model call)');
   lines.push('');
@@ -366,10 +421,39 @@ export function renderMarkdownReport(options: {
       lines.push(`*Affects:* ${decision.affected_requirements.join(', ') || '(nothing named)'}`);
       lines.push('');
     }
-    if (result.synthesis.changed_due_to_feedback.length > 0) {
-      lines.push('**Changed because of round-2 feedback:**');
+    if (result.synthesis.requirement_dispositions.length > 0) {
+      lines.push('#### Requirement dispositions');
       lines.push('');
-      for (const change of result.synthesis.changed_due_to_feedback) lines.push(`- ${change}`);
+      lines.push('| Requirement | Status | Decision | Note |');
+      lines.push('|---|---|---|---|');
+      for (const disposition of result.synthesis.requirement_dispositions) {
+        const flag = disposition.status === 'decided' ? '' : ' **<-- not settled**';
+        lines.push(
+          `| \`${disposition.requirement_id}\` | ${disposition.status}${flag} | ` +
+            `${disposition.decision_id ?? '-'} | ${disposition.note} |`,
+        );
+      }
+      lines.push('');
+    }
+
+    if (result.synthesis.changed_due_to_feedback.length > 0) {
+      lines.push('#### Changed because of round-2 feedback');
+      lines.push('');
+      for (const change of result.synthesis.changed_due_to_feedback) {
+        lines.push(
+          `**\`${change.decision_id}\`** - moved by \`${change.triggered_by_role}\`` +
+            (change.related_proposal_id === null ? '' : ` (on \`${change.related_proposal_id}\`)`),
+        );
+        lines.push('');
+        lines.push(`- Before: ${change.previous_position}`);
+        lines.push(`- After: ${change.revised_position}`);
+        lines.push(`- Why: ${change.why}`);
+        lines.push('');
+      }
+    } else {
+      lines.push('#### Changed because of round-2 feedback');
+      lines.push('');
+      lines.push('Nothing. Round 2 did not move any decision.');
       lines.push('');
     }
   }

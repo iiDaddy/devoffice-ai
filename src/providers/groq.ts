@@ -162,22 +162,56 @@ export class GroqProvider implements ModelProvider {
     for (let repair = 0; repair <= maxRepairs; repair += 1) {
       const estimated = estimateTokens(messages) + request.maxOutputTokens;
 
-      const raw = await this.options.throttle.run(estimated, async (reconcile) => {
-        const result = await withTransportRetry(
-          async () => this.postChatCompletion(messages, request.maxOutputTokens, request),
-          {
-            maxRetries: this.options.maxTransportRetries ?? 2,
-            clock: this.clock,
-            ...(this.options.backoff !== undefined ? { backoff: this.options.backoff } : {}),
-            onRetry: ({ attempt, waitMs, error }) => {
-              this.options.onRetry?.({ attempt, waitMs, code: error.code, message: error.message });
+      let raw: { content: string; usage: ModelUsage; requestId: string | null };
+      try {
+        raw = await this.options.throttle.run(estimated, async (reconcile) => {
+          const result = await withTransportRetry(
+            async () => this.postChatCompletion(messages, request.maxOutputTokens, request),
+            {
+              maxRetries: this.options.maxTransportRetries ?? 2,
+              clock: this.clock,
+              ...(this.options.backoff !== undefined ? { backoff: this.options.backoff } : {}),
+              onRetry: ({ attempt, waitMs, error }) => {
+                this.options.onRetry?.({ attempt, waitMs, code: error.code, message: error.message });
+              },
             },
-          },
-        );
-        transportAttempts += result.attempts;
-        reconcile(result.value.usage.totalTokens);
-        return result.value;
-      });
+          );
+          transportAttempts += result.attempts;
+          reconcile(result.value.usage.totalTokens);
+          return result.value;
+        });
+      } catch (error) {
+        if (!isProviderValidationError(error)) throw error;
+
+        // The provider checked the model's JSON against our schema and said no.
+        // Treat it exactly like a Zod failure: tell the model what was wrong
+        // and ask again, within the same repair budget.
+        transportAttempts += 1;
+        validationRetries += 1;
+        const issues = [`schema check failed: ${error.details.issue}`];
+
+        if (repair === maxRepairs) {
+          throw new DevOfficeError(
+            'SCHEMA_INVALID',
+            `Model output failed ${request.contract.schemaName} validation at the provider after ` +
+              `${maxRepairs + 1} attempts:\n  ${error.details.issue}`,
+            { correlationId: request.correlationId, details: { issues } },
+          );
+        }
+
+        this.options.onValidationRetry?.({
+          attempt: validationRetries,
+          schemaName: request.contract.schemaName,
+          issues,
+        });
+
+        // The failed output is deliberately NOT echoed back. It can be
+        // thousands of tokens, and on a free tier with a ~6-8K per-minute
+        // ceiling, original prompt + failed answer + new answer would not fit
+        // in one request. The provider's error already pinpoints the field.
+        messages.push({ role: 'user', content: retryAfterProviderRejection(error.details.issue) });
+        continue;
+      }
 
       const parsed = parseJsonLoosely(raw.content);
       if (!parsed.ok) {
@@ -340,7 +374,38 @@ export class GroqProvider implements ModelProvider {
     this.options.throttle.applyRateLimitHeaders(this.snapshot);
 
     if (!response.ok) {
-      const message = await this.safeBodyText(response);
+      const body = await this.readErrorBody(response);
+      const message = body.message;
+
+      // Groq reports two MODEL-side failures as HTTP 400, which would
+      // otherwise be misread as "we sent a malformed request, never retry".
+      // Found on the first real B2 run; see docs/M0-REPORT.md.
+      if (response.status === 400 && TRUNCATION_PATTERN.test(message)) {
+        throw new DevOfficeError(
+          'OUTPUT_TRUNCATED',
+          `The answer was cut off at the ${maxOutputTokens}-token limit before it was ` +
+            'complete. Raise MODEL_MAX_OUTPUT_TOKENS in .env, then resume the run. ' +
+            `Provider said: ${message}`,
+          { httpStatus: 400, correlationId: request?.correlationId, retryable: false },
+        );
+      }
+      if (
+        response.status === 400 &&
+        request !== null &&
+        (body.code === 'json_validate_failed' || PROVIDER_SCHEMA_PATTERN.test(message))
+      ) {
+        // Strict mode is documented as guaranteed, yet the provider sometimes
+        // still rejects the model's output. That is a model slip, so it goes
+        // to the repair loop - the same treatment as a Zod failure.
+        const details: ProviderValidationDetails = { providerValidation: true, issue: message };
+        throw new DevOfficeError('SCHEMA_INVALID', `Provider rejected the generated JSON: ${message}`, {
+          httpStatus: 400,
+          correlationId: request.correlationId,
+          retryable: false,
+          details,
+        });
+      }
+
       const error = classifyHttpError(response.status, this.snapshot, message, {
         quotaExhaustedThresholdMs: this.options.quotaExhaustedThresholdMs ?? 300_000,
         correlationId: request?.correlationId ?? 'n/a',
@@ -361,9 +426,9 @@ export class GroqProvider implements ModelProvider {
     if (typeof content !== 'string' || content.trim() === '') {
       if (choice?.finish_reason === 'length') {
         throw new DevOfficeError(
-          'SCHEMA_INVALID',
-          `Model hit the ${maxOutputTokens}-token output cap before finishing its JSON. ` +
-            'Raise MODEL_MAX_OUTPUT_TOKENS or shrink the contract.',
+          'OUTPUT_TRUNCATED',
+          `The answer was cut off at the ${maxOutputTokens}-token limit before it was ` +
+            'complete. Raise MODEL_MAX_OUTPUT_TOKENS in .env, then resume the run.',
           { retryable: false },
         );
       }
@@ -384,19 +449,63 @@ export class GroqProvider implements ModelProvider {
   }
 
   private async safeBodyText(response: Response): Promise<string> {
+    return (await this.readErrorBody(response)).message;
+  }
+
+  /**
+   * Read the provider's error envelope in full.
+   *
+   * Groq puts the useful parts in `error.code` (e.g. "json_validate_failed")
+   * and `error.failed_generation`, not only in `error.message`. The first
+   * version kept the message and threw the rest away, which is why a
+   * recoverable schema miss looked identical to a genuinely malformed request.
+   */
+  private async readErrorBody(response: Response): Promise<ProviderErrorBody> {
+    let text: string;
     try {
-      const text = await response.text();
-      try {
-        const parsed = JSON.parse(text) as { error?: { message?: string } };
-        return parsed.error?.message ?? text.slice(0, 500);
-      } catch {
-        return text.slice(0, 500);
-      }
+      text = await response.text();
     } catch {
-      return '(no response body)';
+      return { message: '(no response body)', code: null };
+    }
+    try {
+      const parsed = JSON.parse(text) as { error?: { message?: string; code?: string } };
+      return {
+        message: parsed.error?.message ?? text.slice(0, 500),
+        code: typeof parsed.error?.code === 'string' ? parsed.error.code : null,
+      };
+    } catch {
+      return { message: text.slice(0, 500), code: null };
     }
   }
 }
+
+interface ProviderErrorBody {
+  readonly message: string;
+  readonly code: string | null;
+}
+
+/** Details attached when the PROVIDER, not Zod, rejected the model's JSON. */
+interface ProviderValidationDetails {
+  readonly providerValidation: true;
+  readonly issue: string;
+}
+
+function isProviderValidationError(error: unknown): error is DevOfficeError & { details: ProviderValidationDetails } {
+  return (
+    error instanceof DevOfficeError &&
+    error.code === 'SCHEMA_INVALID' &&
+    typeof error.details === 'object' &&
+    error.details !== null &&
+    (error.details as { providerValidation?: unknown }).providerValidation === true
+  );
+}
+
+/** Groq's wording when strict output was cut off by max_completion_tokens. */
+const TRUNCATION_PATTERN = /max completion tokens reached|truncated to fit max_completion_tokens/i;
+
+/** Groq's wording when the model's own output failed the strict schema. */
+const PROVIDER_SCHEMA_PATTERN =
+  /generated json does not match|failed to generate json|failed to validate json/i;
 
 interface GroqChatResponse {
   readonly id?: string;
@@ -448,6 +557,18 @@ export function parseJsonLoosely(
     }
   }
   return { ok: false, error: lastError };
+}
+
+function retryAfterProviderRejection(issue: string): string {
+  return [
+    'Your previous attempt at this answer was rejected by the schema check:',
+    `- ${issue}`,
+    '',
+    'Produce the COMPLETE JSON object again from the start, following the output',
+    'contract exactly. Every item in an array of objects must itself be an object',
+    'with all of its fields - never a plain string.',
+    'Do not apologise, do not explain, do not wrap it in a code fence.',
+  ].join('\n');
 }
 
 function repairPrompt(issues: readonly string[]): string {

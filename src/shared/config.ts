@@ -53,7 +53,13 @@ const ConfigSchema = z.object({
    */
   QUOTA_EXHAUSTED_THRESHOLD_MS: positiveInt.default(300_000),
 
-  MODEL_MAX_OUTPUT_TOKENS: positiveInt.default(2048),
+  /**
+   * 2048 was the original default and it was too small: on benchmark B2 (seven
+   * roles) the Tech Lead's synthesis was cut off before its last two required
+   * fields. 4096 completed it, and was accepted by the provider on the free
+   * tier, so it is the measured value rather than a guess.
+   */
+  MODEL_MAX_OUTPUT_TOKENS: positiveInt.default(4096),
   MODEL_TEMPERATURE: z.coerce.number().min(0).max(2).default(0.3),
   REQUEST_TIMEOUT_MS: positiveInt.default(90_000),
 
@@ -65,8 +71,34 @@ const ConfigSchema = z.object({
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
 
+/**
+ * Treat an empty environment variable as absent.
+ *
+ * `.env` files are written by humans, and the normal way to say "I have not
+ * chosen this yet" is to leave the value blank:
+ *
+ *     GROQ_MODEL_PLANNING=
+ *
+ * dotenv hands that over as the empty string, which is a PRESENT value, so a
+ * Zod `.default(...)` never fires and `.min(1)` rejects it. The result was a
+ * chicken-and-egg failure: `npm run models` - the command whose entire job is
+ * to tell you which model to put there - refused to start until you had
+ * already put one there.
+ *
+ * Stripping blanks first makes blank mean unset everywhere, for every setting,
+ * rather than patching one field.
+ */
+function withoutBlanks(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (typeof value === 'string' && value.trim() === '') continue;
+    out[key] = value;
+  }
+  return out;
+}
+
 export function loadConfig(source: NodeJS.ProcessEnv = process.env): AppConfig {
-  const result = ConfigSchema.safeParse(source);
+  const result = ConfigSchema.safeParse(withoutBlanks(source));
   if (!result.success) {
     const lines = result.error.issues.map(
       (issue) => `  ${issue.path.join('.') || '(root)'}: ${issue.message}`,

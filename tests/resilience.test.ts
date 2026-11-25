@@ -223,7 +223,7 @@ describe('GroqProvider recovery', () => {
       { status: 200, body: { id: 'r', choices: [{ message: { content: '' }, finish_reason: 'length' }] } },
     ]);
     await expect(provider.generateStructured(buildRequest())).rejects.toMatchObject({
-      code: 'SCHEMA_INVALID',
+      code: 'OUTPUT_TRUNCATED',
     });
   });
 
@@ -313,6 +313,105 @@ describe('schema repair loop (LLD 18 "targeted validation retry")', () => {
     const { provider } = makeProvider([chatOk('I cannot help with that.'), chatOk(validProposal())]);
     const response = await provider.generateStructured(buildRequest());
     expect(response.validationRetries).toBe(1);
+  });
+});
+
+/**
+ * Both error bodies below are the EXACT messages Groq returned on the first
+ * real run of benchmark B2 (24 Nov 2026), copied from the event log. Groq
+ * reports them as HTTP 400, which the first version misread as "we sent a
+ * malformed request" - so a recoverable model slip blocked the meeting.
+ */
+describe('model-side failures that Groq reports as HTTP 400', () => {
+  const truncated400 = {
+    status: 400,
+    body: {
+      error: {
+        message:
+          'max completion tokens reached before generating a valid document: the output was ' +
+          'truncated to fit max_completion_tokens and is missing required content. Increase ' +
+          "max_completion_tokens. See 'failed_generation' for the truncated output. Error: " +
+          "jsonschema: '' does not validate with /required: missing properties: " +
+          "'changed_due_to_feedback', 'unresolved_blockers'",
+        type: 'invalid_request_error',
+        code: 'json_validate_failed',
+        failed_generation: '{"consensus_summary":"...',
+      },
+    },
+  };
+
+  const schemaMiss400 = {
+    status: 400,
+    body: {
+      error: {
+        message:
+          "Generated JSON does not match the expected schema. Please adjust your prompt. See " +
+          "'failed_generation' for more details. Error: jsonschema: '/decisions/1' does not " +
+          'validate with /properties/decisions/items/type: expected object, but got string',
+        type: 'invalid_request_error',
+        code: 'json_validate_failed',
+        failed_generation: '{"decisions":[{},"a plain string"]}',
+      },
+    },
+  };
+
+  it('a truncated answer becomes OUTPUT_TRUNCATED with the setting to change', async () => {
+    const { provider, recorder } = makeProvider([truncated400]);
+
+    let caught: unknown;
+    try {
+      await provider.generateStructured(buildRequest());
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({ code: 'OUTPUT_TRUNCATED', retryable: false });
+    // The message must name the exact setting a human has to change.
+    expect((caught as Error).message).toContain('MODEL_MAX_OUTPUT_TOKENS');
+    // Exactly one call: retrying with the same budget would produce the same cut.
+    expect(recorder.calls).toHaveLength(1);
+  });
+
+  it('a schema miss reported by the provider goes to the repair loop and recovers', async () => {
+    const issues: string[][] = [];
+    const { provider, recorder } = makeProvider([schemaMiss400, chatOk(validProposal())], {
+      onValidationRetry: ({ issues: i }) => issues.push(i),
+    });
+
+    const response = await provider.generateStructured(buildRequest());
+
+    expect(response.validationRetries).toBe(1);
+    expect(recorder.calls).toHaveLength(2);
+    expect(issues[0]?.join(' ')).toContain('/decisions/1');
+
+    // The retry tells the model what was wrong...
+    const retryBody = recorder.calls[1]?.body as { messages: Array<{ role: string; content: string }> };
+    const last = retryBody.messages[retryBody.messages.length - 1];
+    expect(last?.role).toBe('user');
+    expect(last?.content).toContain('expected object, but got string');
+
+    // ...without echoing the failed output, which could blow a free-tier
+    // per-minute token budget in a single request.
+    expect(retryBody.messages.some((m) => m.role === 'assistant')).toBe(false);
+  });
+
+  it('gives up cleanly after the repair budget if the provider keeps rejecting', async () => {
+    const { provider, recorder } = makeProvider([schemaMiss400, schemaMiss400, schemaMiss400]);
+    await expect(provider.generateStructured(buildRequest())).rejects.toMatchObject({
+      code: 'SCHEMA_INVALID',
+    });
+    // maxSchemaRepairs = 2 => 3 attempts, then stop.
+    expect(recorder.calls).toHaveLength(3);
+  });
+
+  it('a genuinely malformed request is still BAD_REQUEST and still not retried', async () => {
+    const { provider, recorder } = makeProvider([
+      { status: 400, body: { error: { message: "'messages' is required", type: 'invalid_request_error' } } },
+    ]);
+    await expect(provider.generateStructured(buildRequest())).rejects.toMatchObject({
+      code: 'BAD_REQUEST',
+    });
+    expect(recorder.calls).toHaveLength(1);
   });
 });
 
